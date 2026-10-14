@@ -1,7 +1,6 @@
 import os
-import re
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from nicegui import ui
 
 RAW_DATABASE_URL = os.environ.get('DATABASE_URL', '')
@@ -13,48 +12,41 @@ else:
 
 PORT = int(os.environ.get('PORT', 8080))
 
-def limpar_ano(val):
-    if pd.isna(val) or val == '':
-        return ''
-    s = str(val).replace('.0', '').strip()
-    match = re.search(r'\d{4}', s)
-    return match.group(0) if match else s
-
-def extrair_numero(row):
-    num_col = str(row.get('decreto_numero', '')).replace('.0', '').strip()
-    if num_col and num_col != 'nan' and num_col != '':
-        return num_col
-    link = str(row.get('link_decreto', '')).strip()
-    match = re.match(r'^(\d+)', link)
-    return match.group(1) if match else ''
-
 def carregar_dados():
     if DATABASE_URL:
         try:
             engine = create_engine(DATABASE_URL)
-            df = pd.read_sql("SELECT * FROM decretos", engine)
+            df = pd.read_sql("SELECT * FROM decretos ORDER BY id ASC", engine)
             if not df.empty:
-                df['exercicio_decreto'] = df['exercicio_decreto'].apply(limpar_ano)
-                df['decreto_numero'] = df.apply(extrair_numero, axis=1)
-                if 'data_elaboracao' in df.columns:
-                    df['data_elaboracao'] = pd.to_datetime(df['data_elaboracao'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
                 return df.fillna('').to_dict('records')
         except Exception as e:
             print(f"Erro ao ler Neon: {e}")
 
-    # Fallback Google Drive
+    # Fallback leitura Google Drive
     url = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
     try:
-        df = pd.read_csv(url).iloc[:, :7]
-        df.columns = [
-            'exercicio_decreto', 'decreto_numero', 'data_elaboracao',
-            'orgao_elaboracao', 'link_decreto', 'complemento_informacoes', 'processo_sei'
-        ]
-        df['exercicio_decreto'] = df['exercicio_decreto'].apply(limpar_ano)
-        df['decreto_numero'] = df.apply(extrair_numero, axis=1)
-        df['data_elaboracao'] = pd.to_datetime(df['data_elaboracao'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
-        df = df.drop(columns=['complemento_informacoes'], errors='ignore')
-        return df.fillna('').to_dict('records')
+        df = pd.read_csv(url).iloc[:, :6]
+        df.columns = ['col0', 'col1', 'col2', 'col3', 'col4', 'col5']
+        
+        # Tratamento de emergência caso o Neon esteja offline
+        registros = []
+        for idx, r in df.iterrows():
+            str_ex = str(r['col0']).replace('.0', '').strip()
+            ano = str_ex[:4] if len(str_ex) >= 4 else str_ex
+            num = str(r['col1']).replace('.0', '').strip()
+            if not num and len(str_ex) > 4:
+                num = str_ex[4:]
+                
+            registros.append({
+                'id': idx + 1,
+                'exercicio_decreto': ano,
+                'decreto_numero': num,
+                'data_elaboracao': str(r['col2']),
+                'orgao_elaboracao': str(r['col3']),
+                'processo_sei': str(r['col4']),
+                'link_decreto': str(r['col5'])
+            })
+        return registros
     except Exception as e:
         print(f"Erro Drive: {e}")
         return []
@@ -69,9 +61,9 @@ def main_page():
 
     with ui.column().classes('w-full p-6 max-w-7xl mx-auto'):
         ui.label('Consulta Pública de Decretos Municipais').classes('text-2xl font-bold text-gray-800 mb-1')
-        ui.label('Pesquise por nome, número do decreto, órgão ou processo SEI. Dê dois cliques em uma linha para editar.').classes('text-gray-600 mb-4')
+        ui.label('Pesquise por ano, número do decreto, órgão ou processo SEI. Dê dois cliques em uma linha para editar.').classes('text-gray-600 mb-4')
 
-        # PAINEL FIXO DE CADASTRO
+        # PAINEL FIXO PARA ADICIONAR NOVO DECRETO
         with ui.expansion('➕ Cadastrar Novo Decreto', icon='add').classes('w-full bg-blue-50 border border-blue-200 rounded-lg mb-6 p-2'):
             with ui.grid(columns=3).classes('w-full gap-4 p-2'):
                 add_ano = ui.input('Ano', placeholder='Ex: 2026')
@@ -79,10 +71,12 @@ def main_page():
                 add_data = ui.input('Data (DD/MM/AAAA)', placeholder='Ex: 14/10/2026')
                 add_orgao = ui.input('Órgão de Elaboração', placeholder='Ex: Coordenadoria...')
                 add_sei = ui.input('Processo SEI', placeholder='Ex: 17129/2025')
-                add_link = ui.input('Link / Nome do Arquivo', placeholder='Ex: 10 Nomeação...pdf')
+                add_link = ui.input('Link / Nome do Arquivo', placeholder='Ex: Decreto 105 G...pdf')
 
             def salvar_novo():
+                novo_id = (max([d.get('id', 0) for d in dados]) + 1) if dados else 1
                 novo = {
+                    'id': novo_id,
                     'exercicio_decreto': add_ano.value,
                     'decreto_numero': add_num.value,
                     'data_elaboracao': add_data.value,
@@ -90,13 +84,21 @@ def main_page():
                     'processo_sei': add_sei.value,
                     'link_decreto': add_link.value
                 }
+                
+                # Inserção com SqlAlchemy no Neon
                 if DATABASE_URL:
                     try:
                         engine = create_engine(DATABASE_URL)
-                        pd.DataFrame([novo]).to_sql('decretos', engine, if_exists='append', index=False)
-                        ui.notify('Decreto cadastrado!', type='positive')
+                        with engine.connect() as conn:
+                            query = text("""
+                                INSERT INTO decretos (id, exercicio_decreto, decreto_numero, data_elaboracao, orgao_elaboracao, processo_sei, link_decreto)
+                                VALUES (:id, :exercicio_decreto, :decreto_numero, :data_elaboracao, :orgao_elaboracao, :processo_sei, :link_decreto)
+                            """)
+                            conn.execute(query, novo)
+                            conn.commit()
+                        ui.notify('Decreto gravado no Banco Neon!', type='positive')
                     except Exception as err:
-                        ui.notify(f'Erro: {err}', type='negative')
+                        ui.notify(f'Erro ao salvar no banco: {err}', type='negative')
 
                 dados.insert(0, novo)
                 tabela.rows = dados
@@ -104,7 +106,7 @@ def main_page():
 
             ui.button('Salvar Decreto', on_click=salvar_novo).classes('bg-green-700 text-white font-bold mt-2')
 
-        # FILTROS
+        # BARRA DE FILTROS
         anos_disponiveis = sorted(list(set(str(d.get('exercicio_decreto', '')).strip() for d in dados if d.get('exercicio_decreto'))), reverse=True)
         opcoes_ano = ['Todos os Anos'] + anos_disponiveis
 
@@ -112,12 +114,12 @@ def main_page():
             search_input = ui.input(placeholder='🔍 Digite para pesquisar...').classes('flex-1 shadow-sm')
             select_ano = ui.select(options=opcoes_ano, value='Todos os Anos', label='Filtrar por Ano').classes('w-48 shadow-sm')
 
-        # COLUNAS (Sem complemento e com Link responsivo)
+        # ESTRUTURA DAS COLUNAS
         colunas = [
             {'name': 'exercicio_decreto', 'label': 'Ano', 'field': 'exercicio_decreto', 'sortable': True, 'align': 'center', 'classes': 'w-20'},
             {'name': 'decreto_numero', 'label': 'Decreto “G”', 'field': 'decreto_numero', 'sortable': True, 'align': 'center', 'classes': 'w-28 font-bold'},
             {'name': 'data_elaboracao', 'label': 'Data', 'field': 'data_elaboracao', 'sortable': True, 'align': 'center', 'classes': 'w-32'},
-            {'name': 'orgao_elaboracao', 'label': 'Elaboração', 'field': 'orgao_elaboracao', 'align': 'left', 'classes': 'w-48'},
+            {'name': 'orgao_elaboracao', 'label': 'Elaboração', 'field': 'orgao_elaboracao', 'align': 'left', 'classes': 'w-56'},
             {'name': 'processo_sei', 'label': 'Processo SEI', 'field': 'processo_sei', 'align': 'left', 'classes': 'w-40'},
             {'name': 'link_decreto', 'label': 'Link / Documento', 'field': 'link_decreto', 'align': 'left', 'classes': 'break-words max-w-xl'}
         ]
@@ -125,11 +127,11 @@ def main_page():
         tabela = ui.table(
             columns=colunas,
             rows=dados,
-            row_key='link_decreto',
+            row_key='id',
             pagination=15
         ).classes('w-full shadow-lg rounded-lg border')
 
-        # RENDERIZADOR DE LINK AUTO-AJUSTÁVEL
+        # LINK COM AUTO-AJUSTE DENTRO DO CONTAINER
         tabela.add_slot('body-cell-link_decreto', '''
             <q-td :props="props" class="whitespace-normal break-all">
                 <template v-if="props.value">
@@ -144,7 +146,7 @@ def main_page():
             </q-td>
         ''')
 
-        # MODAL DE EDIÇÃO AO DAR DUPLO CLIQUE
+        # MODAL DE EDIÇÃO PERSISTENTE (DUPLO CLIQUE)
         with ui.dialog() as modal_edicao, ui.card().classes('w-full max-w-lg p-6'):
             ui.label('Editar Decreto').classes('text-xl font-bold mb-4 text-blue-900')
             edit_ano = ui.input('Ano')
@@ -153,37 +155,58 @@ def main_page():
             edit_orgao = ui.input('Órgão de Elaboração')
             edit_sei = ui.input('Processo SEI')
             edit_link = ui.input('Link / Nome do Arquivo')
-            linha_selecionada = {}
+            linha_atual = {}
 
             def salvar_edicao():
-                linha_selecionada['exercicio_decreto'] = edit_ano.value
-                linha_selecionada['decreto_numero'] = edit_num.value
-                linha_selecionada['data_elaboracao'] = edit_data.value
-                linha_selecionada['orgao_elaboracao'] = edit_orgao.value
-                linha_selecionada['processo_sei'] = edit_sei.value
-                linha_selecionada['link_decreto'] = edit_link.value
+                linha_atual['exercicio_decreto'] = edit_ano.value
+                linha_atual['decreto_numero'] = edit_num.value
+                linha_atual['data_elaboracao'] = edit_data.value
+                linha_atual['orgao_elaboracao'] = edit_orgao.value
+                linha_atual['processo_sei'] = edit_sei.value
+                linha_atual['link_decreto'] = edit_link.value
+
+                # Atualiza diretamente no banco Neon usando o ID
+                if DATABASE_URL and 'id' in linha_atual:
+                    try:
+                        engine = create_engine(DATABASE_URL)
+                        with engine.connect() as conn:
+                            query = text("""
+                                UPDATE decretos 
+                                SET exercicio_decreto = :exercicio_decreto,
+                                    decreto_numero = :decreto_numero,
+                                    data_elaboracao = :data_elaboracao,
+                                    orgao_elaboracao = :orgao_elaboracao,
+                                    processo_sei = :processo_sei,
+                                    link_decreto = :link_decreto
+                                WHERE id = :id
+                            """)
+                            conn.execute(query, linha_atual)
+                            conn.commit()
+                        ui.notify('Alterações salvas permanentemente no Banco Neon!', type='positive')
+                    except Exception as err:
+                        ui.notify(f'Erro ao atualizar no banco: {err}', type='negative')
+
                 tabela.update()
                 modal_edicao.close()
-                ui.notify('Decreto atualizado na visualização!', type='positive')
 
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
                 ui.button('Cancelar', on_click=modal_edicao.close).classes('bg-gray-400 text-white')
                 ui.button('Salvar Alterações', on_click=salvar_edicao).classes('bg-blue-900 text-white font-bold')
 
         def on_row_dblclick(e):
-            nonlocal linha_selecionada
-            linha_selecionada = e.args[1]
-            edit_ano.value = linha_selecionada.get('exercicio_decreto', '')
-            edit_num.value = linha_selecionada.get('decreto_numero', '')
-            edit_data.value = linha_selecionada.get('data_elaboracao', '')
-            edit_orgao.value = linha_selecionada.get('orgao_elaboracao', '')
-            edit_sei.value = linha_selecionada.get('processo_sei', '')
-            edit_link.value = linha_selecionada.get('link_decreto', '')
+            nonlocal linha_atual
+            linha_atual = e.args[1]
+            edit_ano.value = str(linha_atual.get('exercicio_decreto', ''))
+            edit_num.value = str(linha_atual.get('decreto_numero', ''))
+            edit_data.value = str(linha_atual.get('data_elaboracao', ''))
+            edit_orgao.value = str(linha_atual.get('orgao_elaboracao', ''))
+            edit_sei.value = str(linha_atual.get('processo_sei', ''))
+            edit_link.value = str(linha_atual.get('link_decreto', ''))
             modal_edicao.open()
 
         tabela.on('row-dblclick', on_row_dblclick)
 
-        # LÓGICA DE FILTRAGEM
+        # LÓGICA DE FILTRAGEM COMBINADA
         def aplicar_filtros():
             texto_busca = search_input.value.lower() if search_input.value else ''
             ano_sel = select_ano.value
