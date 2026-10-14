@@ -2,41 +2,42 @@ import os
 import pandas as pd
 from nicegui import ui
 
-# Link direto para exportar a planilha do Google Drive em CSV
+# Link de exportação direta do seu Google Sheets em CSV
 SHEETS_URL = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
 PORT = int(os.environ.get('PORT', 8080))
 
 def carregar_dados():
     try:
-        # Lê a planilha do Google Sheets
+        # Lê a planilha diretamente da nuvem
         df = pd.read_csv(SHEETS_URL)
         
-        # Limpa o nome das colunas removendo espaços extras
+        # Limpa espaços em branco nos nomes das colunas
         df.columns = [str(col).strip() for col in df.columns]
 
-        # Mapeia os nomes das colunas da planilha para o padrão da tabela
+        # Mapeamento para garantir a exibição correta
         col_map = {
             'Exercicio': 'exercicio_decreto',
             'ExercicioDecreto': 'exercicio_decreto',
             'Data': 'data_elaboracao',
+            'DataElaboração': 'data_elaboracao',
             'Link do Decreto': 'link_decreto',
             'Link do Decreto ': 'link_decreto',
             'complemento_informacoes': 'complemento_informacoes',
             'Complemento': 'complemento_informacoes',
+            'Complemento de informações de decreto - Nomes, Ruas, Lotes, quadras': 'complemento_informacoes',
             'processo_sei': 'processo_sei',
             'PROCESSO SEI': 'processo_sei'
         }
         df = df.rename(columns=col_map)
 
-        # Seleciona apenas as colunas necessárias
+        # Filtra apenas as colunas principais
         colunas_desejadas = ['exercicio_decreto', 'data_elaboracao', 'processo_sei', 'complemento_informacoes', 'link_decreto']
         colunas_existentes = [c for c in colunas_desejadas if c in df.columns]
         df = df[colunas_existentes]
 
-        # Tratamento simples de valores nulos
         return df.fillna('').to_dict('records')
     except Exception as e:
-        print(f"Erro ao carregar Google Sheets: {e}")
+        print(f"Erro ao carregar dados da planilha: {e}")
         return []
 
 @ui.page('/')
@@ -82,7 +83,7 @@ def main_page():
 
             search_input.bind_value_to(tabela, 'filter')
         else:
-            ui.label('⚠️ Não foi possível carregar os dados da planilha. Verifique se a planilha do Google Drive está pública.').classes('text-red-500 font-bold p-4 bg-red-50 rounded-md')
+            ui.label('⚠️ Não foi possível carregar os dados. Verifique o compartilhamento da planilha no Google Drive.').classes('text-red-500 font-bold p-4 bg-red-50 rounded-md')
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(host='0.0.0.0', port=PORT, reload=False)
