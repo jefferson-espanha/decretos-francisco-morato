@@ -13,7 +13,7 @@ else:
 PORT = int(os.environ.get('PORT', 8080))
 
 def carregar_dados():
-    # 1. Tenta buscar no banco de dados Neon
+    # 1. Tenta carregar do banco Neon
     if DATABASE_URL:
         try:
             engine = create_engine(DATABASE_URL)
@@ -21,32 +21,22 @@ def carregar_dados():
             if not df.empty:
                 return df.fillna('').to_dict('records')
         except Exception as e:
-            print(f"Erro ao conectar ao Neon: {e}. Carregando do Google Drive...")
+            print(f"Erro ao ler do Neon: {e}. Carregando do Google Drive...")
 
-    # 2. Fallback direto do Google Sheets
+    # 2. Fallback direto do Google Sheets lendo por posição
     url = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
     try:
         df = pd.read_csv(url)
-        col_map = {}
-        for col in df.columns:
-            c_str = str(col).strip()
-            c_lower = c_str.lower()
-            if 'exercicio' in c_lower or 'ano' in c_lower:
-                col_map[col] = 'exercicio_decreto'
-            elif 'decreto' in c_lower and ('g' in c_lower or '“' in c_str or '"' in c_str):
-                col_map[col] = 'decreto_numero'
-            elif 'data' in c_lower:
-                col_map[col] = 'data_elaboracao'
-            elif 'elabora' in c_lower:
-                col_map[col] = 'orgao_elaboracao'
-            elif 'link' in c_lower:
-                col_map[col] = 'link_decreto'
-            elif 'complemento' in c_lower or 'informaco' in c_lower or 'ruas' in c_lower:
-                col_map[col] = 'complemento_informacoes'
-            elif 'sei' in c_lower:
-                col_map[col] = 'processo_sei'
-
-        df = df.rename(columns=col_map)
+        df = df.iloc[:, :7]
+        df.columns = [
+            'exercicio_decreto',
+            'decreto_numero',
+            'data_elaboracao',
+            'orgao_elaboracao',
+            'link_decreto',
+            'complemento_informacoes',
+            'processo_sei'
+        ]
         return df.fillna('').to_dict('records')
     except Exception as e:
         print(f"Erro ao carregar dados do Google Sheets: {e}")
@@ -85,11 +75,17 @@ def main_page():
                 pagination=15
             ).classes('w-full shadow-lg rounded-lg border')
 
+            # Renderizador seguro de links: trata URLs completas (https://) e nomes de PDF
             tabela.add_slot('body-cell-link_decreto', '''
                 <q-td :props="props">
-                    <a v-if="props.value" :href="props.value" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
-                        Abrir ↗
-                    </a>
+                    <template v-if="props.value">
+                        <a v-if="props.value.startsWith('http')" :href="props.value" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
+                            Abrir ↗
+                        </a>
+                        <a v-else :href="'https://drive.google.com/drive/search?q=' + encodeURIComponent(props.value)" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
+                            {{ props.value }} ↗
+                        </a>
+                    </template>
                     <span v-else class="text-gray-400">-</span>
                 </q-td>
             ''')
