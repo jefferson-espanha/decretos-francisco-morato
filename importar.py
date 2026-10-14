@@ -15,33 +15,32 @@ if RAW_DATABASE_URL.startswith("postgresql://"):
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
-def extrair_numero_decreto(row):
-    # Se já existir valor na coluna decreto_numero, utiliza
-    num_existente = str(row.get('decreto_numero', '')).strip()
-    if num_existente and num_existente != 'nan':
-        return num_existente
-    
-    # Se o numero veio grudado com o ano na coluna exercicio (ex: 19841, 198410)
-    exercicio_str = str(row.get('exercicio_decreto', '')).strip()
-    if len(exercicio_str) > 4:
-        ano = exercicio_str[:4]
-        num = exercicio_str[4:]
-        return num
-    return ''
+def limpar_ano(val):
+    if pd.isna(val) or val == '':
+        return ''
+    s = str(val).replace('.0', '').strip()
+    match = re.search(r'\d{4}', s)
+    return match.group(0) if match else s
 
-def extrair_ano(row):
-    exercicio_str = str(row.get('exercicio_decreto', '')).strip()
-    if len(exercicio_str) >= 4:
-        return exercicio_str[:4]
-    return exercicio_str
+def extrair_numero(row):
+    num_col = str(row.get('decreto_numero', '')).replace('.0', '').strip()
+    if num_col and num_col != 'nan':
+        return num_col
+
+    # Se estiver no link (ex: "10 Nomeação do Conselho...")
+    link = str(row.get('link_decreto', '')).strip()
+    match = re.match(r'^(\d+)', link)
+    if match:
+        return match.group(1)
+    
+    return ''
 
 def importar_sheets():
     print("Baixando planilha do Google Drive...")
     df = pd.read_csv(SHEETS_URL)
 
-    # Pega as primeiras 7 colunas
+    # Pega as colunas na ordem original
     df = df.iloc[:, :7]
-
     df.columns = [
         'exercicio_decreto',
         'decreto_numero',
@@ -52,14 +51,13 @@ def importar_sheets():
         'processo_sei'
     ]
 
-    # Ajusta ano e número do decreto
-    df['decreto_numero'] = df.apply(extrair_numero_decreto, axis=1)
-    df['exercicio_decreto'] = df.apply(extrair_ano, axis=1)
-
-    # Formata a data para DD/MM/AAAA
+    # Limpeza e extração
+    df['exercicio_decreto'] = df['exercicio_decreto'].apply(limpar_ano)
+    df['decreto_numero'] = df.apply(extrair_numero, axis=1)
     df['data_elaboracao'] = pd.to_datetime(df['data_elaboracao'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
 
-    # Preenche nulos
+    # Remove a coluna de complemento da gravação
+    df = df.drop(columns=['complemento_informacoes'], errors='ignore')
     df = df.fillna('')
 
     print(f"Total de {len(df)} linhas processadas.")
