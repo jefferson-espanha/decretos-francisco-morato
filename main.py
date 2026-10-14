@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 import uuid
 
 import pandas as pd
@@ -14,6 +15,8 @@ else:
     DATABASE_URL = RAW_DATABASE_URL
 
 PORT = int(os.environ.get('PORT', 8080))
+
+URL_PLANILHA = 'https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv'
 
 COLUNAS_DADOS = [
     'exercicio_decreto',
@@ -92,27 +95,118 @@ def normalizar_registros(registros):
     return normalizados
 
 
-def carregar_dados():
-    if DATABASE_URL:
-        try:
-            engine = create_engine(DATABASE_URL)
-            df = pd.read_sql('SELECT * FROM decretos', engine)
-            if not df.empty:
-                return normalizar_registros(df.to_dict('records'))
-        except Exception as e:
-            print(f'Erro ao ler do Neon: {e}. Carregando do Drive...')
+def normalizar_cabecalho(valor):
+    sem_acento = unicodedata.normalize('NFKD', str(valor))
+    sem_acento = ''.join(c for c in sem_acento if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+', ' ', sem_acento.lower()).strip()
 
-    # Fallback direto do Google Drive
-    url = 'https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv'
+
+def carregar_planilha():
+    """Lê a planilha pelo nome dos cabeçalhos, não pela posição das colunas."""
+    df = pd.read_csv(URL_PLANILHA, dtype=str)
+    cabecalhos = {normalizar_cabecalho(coluna): coluna for coluna in df.columns}
+
+    def encontrar_coluna(*nomes, inicio=None):
+        for nome in nomes:
+            chave = normalizar_cabecalho(nome)
+            if chave in cabecalhos:
+                return cabecalhos[chave]
+        if inicio:
+            chave_inicio = normalizar_cabecalho(inicio)
+            for chave, coluna in cabecalhos.items():
+                if chave.startswith(chave_inicio):
+                    return coluna
+        return None
+
+    fontes = {
+        'exercicio_decreto': encontrar_coluna('Exercicio', 'Exercício', 'Ano'),
+        'decreto_numero': encontrar_coluna('Decreto G', 'Decreto Numero', 'Número do Decreto G'),
+        'data_elaboracao': encontrar_coluna('Data', 'Data Elaboracao'),
+        'orgao_elaboracao': encontrar_coluna('Elaboracao', 'Orgao Elaboracao'),
+        'processo_sei': encontrar_coluna('Processo SEI'),
+        'link_decreto': encontrar_coluna('Link do Decreto', 'Link Decreto'),
+        'complemento_informacoes': encontrar_coluna(inicio='Complemento'),
+    }
+
+    resultado = pd.DataFrame(index=df.index)
+    for campo, coluna in fontes.items():
+        resultado[campo] = df[coluna] if coluna else ''
+    registros = normalizar_registros(resultado.to_dict('records'))
+    return [
+        registro for registro in registros
+        if registro['exercicio_decreto'] and registro['decreto_numero']
+    ]
+
+
+def carregar_banco():
+    if not DATABASE_URL:
+        return []
     try:
-        df = pd.read_csv(url, dtype=str).iloc[:, :len(COLUNAS_DADOS)].copy()
-        while len(df.columns) < len(COLUNAS_DADOS):
-            df[f'coluna_extra_{len(df.columns)}'] = ''
-        df.columns = COLUNAS_DADOS
-        return normalizar_registros(df.to_dict('records'))
+        engine = create_engine(DATABASE_URL)
+        df = pd.read_sql('SELECT * FROM decretos', engine)
+        return normalizar_registros(df.to_dict('records')) if not df.empty else []
+    except Exception as e:
+        print(f'Erro ao ler do Neon: {e}')
+        return []
+
+
+def carregar_dados():
+    # A planilha oficial contém Exercicio e Decreto “G” em colunas distintas.
+    # Ela é usada como referência quando o banco tem números vazios.
+    try:
+        dados_planilha = carregar_planilha()
     except Exception as e:
         print(f'Erro ao carregar do Drive: {e}')
-        return []
+        dados_planilha = []
+
+    dados_banco = carregar_banco()
+    if not dados_planilha:
+        return dados_banco
+    if not dados_banco:
+        return dados_planilha
+
+    por_ano_numero = {
+        (linha['exercicio_decreto'], linha['decreto_numero']): i
+        for i, linha in enumerate(dados_planilha)
+        if linha['exercicio_decreto'] and linha['decreto_numero']
+    }
+    por_ano_data = {}
+    for i, linha in enumerate(dados_planilha):
+        chave = (linha['exercicio_decreto'], linha['data_elaboracao'])
+        if all(chave):
+            por_ano_data.setdefault(chave, []).append(i)
+
+    for registro in dados_banco:
+        ano = registro['exercicio_decreto']
+        numero = registro['decreto_numero']
+        indice = por_ano_numero.get((ano, numero)) if numero else None
+
+        if indice is None and ano and registro['data_elaboracao']:
+            candidatos = por_ano_data.get((ano, registro['data_elaboracao']), [])
+            for campo in ('orgao_elaboracao', 'link_decreto', 'processo_sei'):
+                valor = registro.get(campo, '')
+                if valor:
+                    filtrados = [i for i in candidatos if dados_planilha[i].get(campo) == valor]
+                    if filtrados:
+                        candidatos = filtrados
+            if len(candidatos) == 1:
+                indice = candidatos[0]
+
+        if indice is not None:
+            destino = dados_planilha[indice]
+            for campo in COLUNAS_DADOS:
+                # O ano e o número da planilha são a referência canônica.
+                if campo in ('exercicio_decreto', 'decreto_numero'):
+                    continue
+                if registro.get(campo):
+                    destino[campo] = registro[campo]
+        elif numero:
+            # Mantém decretos cadastrados no banco que ainda não estão na planilha.
+            registro['_row_key'] = uuid.uuid4().hex
+            dados_planilha.append(registro)
+            por_ano_numero[(ano, numero)] = len(dados_planilha) - 1
+
+    return dados_planilha
 
 
 @ui.page('/')
