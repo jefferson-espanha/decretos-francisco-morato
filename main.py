@@ -2846,11 +2846,19 @@ def main_page():
             reverse=True,
         )
         opcoes_ano = ['Todos os Anos'] + anos_disponiveis
+        estado_lista = {'pagina': 1, 'filtrados': [], 'texto_busca': ''}
+
+        def executar_busca(evento=None):
+            estado_lista['texto_busca'] = texto_limpo(search_input.value).casefold()
+            aplicar_filtros()
 
         with ui.row().classes('w-full gap-4 mb-4 items-center'):
             search_input = ui.input(
                 placeholder='🔍 Digite para pesquisar em toda a tabela...'
-            ).classes('flex-1 shadow-sm').props('debounce=250')
+            ).classes('flex-1 shadow-sm')
+            ui.button('Buscar', on_click=executar_busca).classes(
+                'bg-blue-700 hover:bg-blue-800 text-white font-bold'
+            )
             select_ano = ui.select(
                 options=opcoes_ano,
                 value='Todos os Anos',
@@ -2940,10 +2948,9 @@ def main_page():
         ''')
 
         tamanho_pagina = 50
-        estado_lista = {'pagina': 1, 'filtrados': []}
 
         def aplicar_filtros(reset_pagina=True):
-            texto_busca = texto_limpo(search_input.value).casefold()
+            texto_busca = estado_lista['texto_busca']
             ano_sel = select_ano.value or 'Todos os Anos'
             if reset_pagina:
                 estado_lista['pagina'] = 1
@@ -2996,7 +3003,7 @@ def main_page():
             informacao_pagina = ui.label('Carregando decretos...').classes('text-sm text-gray-600')
             ui.button('Próxima →', on_click=proxima_pagina).props('outline')
 
-        search_input.on('update:model-value', aplicar_filtros)
+        search_input.on('keydown.enter', executar_busca)
         select_ano.on('update:model-value', aplicar_filtros)
         aplicar_filtros()
 
