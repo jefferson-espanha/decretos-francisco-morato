@@ -1,43 +1,45 @@
 import os
 import pandas as pd
+from sqlalchemy import create_engine
 from nicegui import ui
 
-# Link de exportação direta do seu Google Sheets em CSV
-SHEETS_URL = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
+RAW_DATABASE_URL = os.environ.get('DATABASE_URL', '')
+
+if RAW_DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = RAW_DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+else:
+    DATABASE_URL = RAW_DATABASE_URL
+
 PORT = int(os.environ.get('PORT', 8080))
 
-def carregar_dados():
+def buscar_decretos():
+    if not DATABASE_URL:
+        # Fallback para carregar diretamente do Google Sheets caso o banco esteja indisponível
+        url = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
+        try:
+            df = pd.read_csv(url)
+            df.columns = [str(col).strip() for col in df.columns]
+            col_map = {
+                'Exercicio': 'exercicio_decreto',
+                'Decreto “G”': 'decreto_numero',
+                'Data': 'data_elaboracao',
+                'Elaboração': 'orgao_elaboracao',
+                'Link do Decreto': 'link_decreto',
+                'Complemento de informações de decreto - Nomes, Ruas, Lotes, quadras': 'complemento_informacoes',
+                'PROCESSO SEI': 'processo_sei'
+            }
+            df = df.rename(columns=col_map)
+            return df.fillna('').to_dict('records')
+        except Exception as e:
+            print(f"Erro ao carregar dados: {e}")
+            return []
+
     try:
-        # Lê a planilha diretamente da nuvem
-        df = pd.read_csv(SHEETS_URL)
-        
-        # Limpa espaços em branco nos nomes das colunas
-        df.columns = [str(col).strip() for col in df.columns]
-
-        # Mapeamento para garantir a exibição correta
-        col_map = {
-            'Exercicio': 'exercicio_decreto',
-            'ExercicioDecreto': 'exercicio_decreto',
-            'Data': 'data_elaboracao',
-            'DataElaboração': 'data_elaboracao',
-            'Link do Decreto': 'link_decreto',
-            'Link do Decreto ': 'link_decreto',
-            'complemento_informacoes': 'complemento_informacoes',
-            'Complemento': 'complemento_informacoes',
-            'Complemento de informações de decreto - Nomes, Ruas, Lotes, quadras': 'complemento_informacoes',
-            'processo_sei': 'processo_sei',
-            'PROCESSO SEI': 'processo_sei'
-        }
-        df = df.rename(columns=col_map)
-
-        # Filtra apenas as colunas principais
-        colunas_desejadas = ['exercicio_decreto', 'data_elaboracao', 'processo_sei', 'complemento_informacoes', 'link_decreto']
-        colunas_existentes = [c for c in colunas_desejadas if c in df.columns]
-        df = df[colunas_existentes]
-
+        engine = create_engine(DATABASE_URL)
+        df = pd.read_sql("SELECT * FROM decretos", engine)
         return df.fillna('').to_dict('records')
     except Exception as e:
-        print(f"Erro ao carregar dados da planilha: {e}")
+        print(f"Erro no banco: {e}")
         return []
 
 @ui.page('/')
@@ -49,20 +51,22 @@ def main_page():
 
     with ui.column().classes('w-full p-6 max-w-7xl mx-auto'):
         ui.label('Consulta Pública de Decretos Municipais').classes('text-2xl font-bold text-gray-800 mb-1')
-        ui.label('Pesquise por complemento, ruas, lotes, quadras ou processo SEI.').classes('text-gray-600 mb-6')
+        ui.label('Pesquise por complemento, ruas, número de decreto, elaboração ou processo SEI.').classes('text-gray-600 mb-6')
 
-        dados = carregar_dados()
+        dados = buscar_decretos()
 
         if dados:
             colunas = [
                 {'name': 'exercicio_decreto', 'label': 'Ano', 'field': 'exercicio_decreto', 'sortable': True, 'align': 'center'},
+                {'name': 'decreto_numero', 'label': 'Decreto “G”', 'field': 'decreto_numero', 'sortable': True, 'align': 'center'},
                 {'name': 'data_elaboracao', 'label': 'Data', 'field': 'data_elaboracao', 'sortable': True, 'align': 'center'},
-                {'name': 'processo_sei', 'label': 'Processo SEI', 'field': 'processo_sei', 'sortable': True, 'align': 'left'},
+                {'name': 'orgao_elaboracao', 'label': 'Elaboração', 'field': 'orgao_elaboracao', 'align': 'left'},
+                {'name': 'processo_sei', 'label': 'Processo SEI', 'field': 'processo_sei', 'align': 'left'},
                 {'name': 'complemento_informacoes', 'label': 'Informações / Complemento', 'field': 'complemento_informacoes', 'align': 'left', 'classes': 'max-w-md break-words'},
-                {'name': 'link_decreto', 'label': 'Link do Decreto', 'field': 'link_decreto', 'align': 'center'}
+                {'name': 'link_decreto', 'label': 'Link', 'field': 'link_decreto', 'align': 'center'}
             ]
 
-            search_input = ui.input(placeholder='🔍 Digite para pesquisar...').classes('w-full mb-4 shadow-sm')
+            search_input = ui.input(placeholder='🔍 Digite para pesquisar em todas as colunas...').classes('w-full mb-4 shadow-sm')
 
             tabela = ui.table(
                 columns=colunas,
@@ -71,11 +75,11 @@ def main_page():
                 pagination=15
             ).classes('w-full shadow-lg rounded-lg border')
 
-            # Renderiza os links como botões clicáveis
+            # Renderiza o link do decreto como botão clicável
             tabela.add_slot('body-cell-link_decreto', '''
                 <q-td :props="props">
                     <a v-if="props.value" :href="props.value" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
-                        Abrir Documento ↗
+                        Abrir ↗
                     </a>
                     <span v-else class="text-gray-400">-</span>
                 </q-td>
@@ -83,7 +87,7 @@ def main_page():
 
             search_input.bind_value_to(tabela, 'filter')
         else:
-            ui.label('⚠️ Não foi possível carregar os dados. Verifique o compartilhamento da planilha no Google Drive.').classes('text-red-500 font-bold p-4 bg-red-50 rounded-md')
+            ui.label('⚠️ Não foi possível carregar a tabela. Verifique se a planilha está pública no Google Drive.').classes('text-red-500 font-bold p-4 bg-red-50 rounded-md')
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(host='0.0.0.0', port=PORT, reload=False)
