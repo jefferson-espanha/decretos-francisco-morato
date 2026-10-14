@@ -1,7 +1,6 @@
 import os
-import re
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from nicegui import ui
 
 RAW_DATABASE_URL = os.environ.get('DATABASE_URL', '')
@@ -17,43 +16,33 @@ def carregar_dados():
     if DATABASE_URL:
         try:
             engine = create_engine(DATABASE_URL)
-            df = pd.read_sql("SELECT * FROM decretos ORDER BY id ASC", engine)
+            df = pd.read_sql("SELECT * FROM decretos", engine)
             if not df.empty:
+                # Trata formatação de datas
+                if 'data_elaboracao' in df.columns:
+                    df['data_elaboracao'] = pd.to_datetime(df['data_elaboracao'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
                 return df.fillna('').to_dict('records')
         except Exception as e:
-            print(f"Erro ao ler banco Neon: {e}")
+            print(f"Erro ao ler do Neon: {e}. Carregando do Drive...")
 
-    # Fallback caso o banco falhe
+    # Fallback direto do Google Drive
     url = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
     try:
-        df = pd.read_csv(url).iloc[:, :6]
-        df.columns = ['col0', 'col1', 'col2', 'col3', 'col4', 'col5']
+        df = pd.read_csv(url).iloc[:, :7]
+        df.columns = [
+            'exercicio_decreto', 'decreto_numero', 'data_elaboracao',
+            'orgao_elaboracao', 'link_decreto', 'complemento_informacoes', 'processo_sei'
+        ]
         
-        registros = []
-        for idx, r in df.iterrows():
-            col0 = str(r['col0']).replace('.0', '').strip()
-            ano = col0[:4] if len(col0) >= 4 else col0
-            num = str(r['col1']).replace('.0', '').strip()
-            if not num or num == 'nan':
-                if len(col0) > 4:
-                    num = col0[4:]
-                else:
-                    link_s = str(r['col5']).strip()
-                    m = re.search(r'Decreto\s+(\d+)', link_s, re.IGNORECASE)
-                    num = str(int(m.group(1))) if m else ''
-
-            registros.append({
-                'id': idx + 1,
-                'exercicio_decreto': ano,
-                'decreto_numero': num,
-                'data_elaboracao': str(r['col2']),
-                'orgao_elaboracao': str(r['col3']),
-                'processo_sei': str(r['col4']),
-                'link_decreto': str(r['col5'])
-            })
-        return registros
+        # Corrige extração de ano e decreto se estiverem grudados
+        df['exercicio_decreto'] = df['exercicio_decreto'].astype(str).str.strip()
+        df['decreto_numero'] = df['exercicio_decreto'].apply(lambda x: x[4:] if len(x) > 4 else '')
+        df['exercicio_decreto'] = df['exercicio_decreto'].apply(lambda x: x[:4] if len(x) >= 4 else x)
+        
+        df['data_elaboracao'] = pd.to_datetime(df['data_elaboracao'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
+        return df.fillna('').to_dict('records')
     except Exception as e:
-        print(f"Erro ao carregar Google Drive: {e}")
+        print(f"Erro ao carregar do Drive: {e}")
         return []
 
 @ui.page('/')
@@ -61,170 +50,121 @@ def main_page():
     ui.colors(primary='#1e3a8a')
     dados = carregar_dados()
 
+    # Cabeçalho Principal
     with ui.header().classes('bg-blue-900 text-white p-4 flex justify-between items-center shadow-md'):
         ui.label('Prefeitura de Francisco Morato — Decretos').classes('text-xl font-bold')
+        
+        # Botão para abrir o Modal de Novo Decreto
+        ui.button('➕ Adicionar Decreto', on_click=lambda: modal_cadastro.open()).classes('bg-green-600 hover:bg-green-700 text-white font-bold')
 
     with ui.column().classes('w-full p-6 max-w-7xl mx-auto'):
         ui.label('Consulta Pública de Decretos Municipais').classes('text-2xl font-bold text-gray-800 mb-1')
-        ui.label('Pesquise por ano, número do decreto, órgão ou processo SEI. Dê dois cliques para editar uma linha.').classes('text-gray-600 mb-4')
+        ui.label('Pesquise por nome, rua, lote, número do decreto, órgão ou processo SEI.').classes('text-gray-600 mb-6')
 
-        # PAINEL FIXO PARA ADICIONAR NOVO DECRETO
-        with ui.expansion('➕ Cadastrar Novo Decreto', icon='add').classes('w-full bg-blue-50 border border-blue-200 rounded-lg mb-6 p-2'):
-            with ui.grid(columns=3).classes('w-full gap-4 p-2'):
-                add_ano = ui.input('Ano', placeholder='Ex: 2026')
-                add_num = ui.input('Número Decreto "G"', placeholder='Ex: 105')
-                add_data = ui.input('Data (DD/MM/AAAA)', placeholder='Ex: 14/10/2026')
-                add_orgao = ui.input('Órgão de Elaboração', placeholder='Ex: Coordenadoria...')
-                add_sei = ui.input('Processo SEI', placeholder='Ex: 17129/2025')
-                add_link = ui.input('Link / Nome do Arquivo', placeholder='Ex: Decreto 105 G...pdf')
-
-            def salvar_novo():
-                novo_id = (max([d.get('id', 0) for d in dados]) + 1) if dados else 1
-                novo = {
-                    'id': novo_id,
-                    'exercicio_decreto': add_ano.value,
-                    'decreto_numero': add_num.value,
-                    'data_elaboracao': add_data.value,
-                    'orgao_elaboracao': add_orgao.value,
-                    'processo_sei': add_sei.value,
-                    'link_decreto': add_link.value
-                }
-
-                if DATABASE_URL:
-                    try:
-                        engine = create_engine(DATABASE_URL)
-                        with engine.connect() as conn:
-                            query = text("""
-                                INSERT INTO decretos (id, exercicio_decreto, decreto_numero, data_elaboracao, orgao_elaboracao, processo_sei, link_decreto)
-                                VALUES (:id, :exercicio_decreto, :decreto_numero, :data_elaboracao, :orgao_elaboracao, :processo_sei, :link_decreto)
-                            """)
-                            conn.execute(query, novo)
-                            conn.commit()
-                        ui.notify('Decreto gravado no Banco Neon!', type='positive')
-                    except Exception as err:
-                        ui.notify(f'Erro ao salvar: {err}', type='negative')
-
-                dados.insert(0, novo)
-                tabela.rows = dados
-                add_ano.value = add_num.value = add_data.value = add_orgao.value = add_sei.value = add_link.value = ''
-
-            ui.button('Salvar Decreto', on_click=salvar_novo).classes('bg-green-700 text-white font-bold mt-2')
-
-        # BARRA DE FILTROS
+        # Extrai lista de anos únicos para o filtro dropdown
         anos_disponiveis = sorted(list(set(str(d.get('exercicio_decreto', '')).strip() for d in dados if d.get('exercicio_decreto'))), reverse=True)
         opcoes_ano = ['Todos os Anos'] + anos_disponiveis
 
+        # Barra de Filtros
         with ui.row().classes('w-full gap-4 mb-4 items-center'):
-            search_input = ui.input(placeholder='🔍 Digite para pesquisar...').classes('flex-1 shadow-sm')
+            search_input = ui.input(placeholder='🔍 Digite para pesquisar em toda a tabela...').classes('flex-1 shadow-sm')
             select_ano = ui.select(options=opcoes_ano, value='Todos os Anos', label='Filtrar por Ano').classes('w-48 shadow-sm')
 
-        # COLUNAS
-        colunas = [
-            {'name': 'exercicio_decreto', 'label': 'Ano', 'field': 'exercicio_decreto', 'sortable': True, 'align': 'center', 'classes': 'w-20'},
-            {'name': 'decreto_numero', 'label': 'Decreto “G”', 'field': 'decreto_numero', 'sortable': True, 'align': 'center', 'classes': 'w-28 font-bold'},
-            {'name': 'data_elaboracao', 'label': 'Data', 'field': 'data_elaboracao', 'sortable': True, 'align': 'center', 'classes': 'w-32'},
-            {'name': 'orgao_elaboracao', 'label': 'Elaboração', 'field': 'orgao_elaboracao', 'align': 'left', 'classes': 'w-56'},
-            {'name': 'processo_sei', 'label': 'Processo SEI', 'field': 'processo_sei', 'align': 'left', 'classes': 'w-40'},
-            {'name': 'link_decreto', 'label': 'Link / Documento', 'field': 'link_decreto', 'align': 'left', 'classes': 'break-words max-w-xl'}
-        ]
+        if dados:
+            colunas = [
+                {'name': 'exercicio_decreto', 'label': 'Ano', 'field': 'exercicio_decreto', 'sortable': True, 'align': 'center'},
+                {'name': 'decreto_numero', 'label': 'Decreto “G”', 'field': 'decreto_numero', 'sortable': True, 'align': 'center'},
+                {'name': 'data_elaboracao', 'label': 'Data', 'field': 'data_elaboracao', 'sortable': True, 'align': 'center'},
+                {'name': 'orgao_elaboracao', 'label': 'Elaboração', 'field': 'orgao_elaboracao', 'align': 'left'},
+                {'name': 'processo_sei', 'label': 'Processo SEI', 'field': 'processo_sei', 'align': 'left'},
+                {'name': 'complemento_informacoes', 'label': 'Informações / Complemento', 'field': 'complemento_informacoes', 'align': 'left', 'classes': 'max-w-md break-words'},
+                {'name': 'link_decreto', 'label': 'Link', 'field': 'link_decreto', 'align': 'center'}
+            ]
 
-        tabela = ui.table(
-            columns=colunas,
-            rows=dados,
-            row_key='id',
-            pagination=15
-        ).classes('w-full shadow-lg rounded-lg border')
+            tabela = ui.table(
+                columns=colunas,
+                rows=dados,
+                row_key='exercicio_decreto',
+                pagination=15
+            ).classes('w-full shadow-lg rounded-lg border')
 
-        # AUTO-AJUSTE E LINK NATIVO
-        tabela.add_slot('body-cell-link_decreto', '''
-            <q-td :props="props" class="whitespace-normal break-all">
-                <template v-if="props.value">
-                    <a v-if="props.value.startsWith('http')" :href="props.value" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
-                        {{ props.value }} ↗
-                    </a>
-                    <a v-else :href="'https://drive.google.com/drive/search?q=' + encodeURIComponent(props.value)" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
-                        {{ props.value }} ↗
-                    </a>
-                </template>
-                <span v-else class="text-gray-400">-</span>
-            </q-td>
-        ''')
+            # Renderização de Links Seguros
+            tabela.add_slot('body-cell-link_decreto', '''
+                <q-td :props="props">
+                    <template v-if="props.value">
+                        <a v-if="props.value.startsWith('http')" :href="props.value" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
+                            Abrir ↗
+                        </a>
+                        <a v-else :href="'https://drive.google.com/drive/search?q=' + encodeURIComponent(props.value)" target="_blank" class="text-blue-600 underline font-medium hover:text-blue-800">
+                            {{ props.value }} ↗
+                        </a>
+                    </template>
+                    <span v-else class="text-gray-400">-</span>
+                </q-td>
+            ''')
 
-        # MODAL DE EDIÇÃO PERSISTENTE (DUPLO CLIQUE)
-        with ui.dialog() as modal_edicao, ui.card().classes('w-full max-w-lg p-6'):
-            ui.label('Editar Decreto').classes('text-xl font-bold mb-4 text-blue-900')
-            edit_ano = ui.input('Ano')
-            edit_num = ui.input('Número Decreto "G"')
-            edit_data = ui.input('Data')
-            edit_orgao = ui.input('Órgão de Elaboração')
-            edit_sei = ui.input('Processo SEI')
-            edit_link = ui.input('Link / Nome do Arquivo')
-            linha_atual = {}
+            # Lógica Combinada dos Filtros (Busca Geral + Filtro por Ano)
+            def aplicar_filtros():
+                texto_busca = search_input.value.lower() if search_input.value else ''
+                ano_sel = select_ano.value
 
-            def salvar_edicao():
-                linha_atual['exercicio_decreto'] = edit_ano.value
-                linha_atual['decreto_numero'] = edit_num.value
-                linha_atual['data_elaboracao'] = edit_data.value
-                linha_atual['orgao_elaboracao'] = edit_orgao.value
-                linha_atual['processo_sei'] = edit_sei.value
-                linha_atual['link_decreto'] = edit_link.value
+                def filtrar_linha(row):
+                    # Filtro por ano
+                    if ano_sel != 'Todos os Anos' and str(row.get('exercicio_decreto', '')).strip() != ano_sel:
+                        return False
+                    
+                    # Filtro por texto
+                    if texto_busca:
+                        valores = ' '.join(str(v) for v in row.values()).lower()
+                        return texto_busca in valores
+                    return True
 
-                if DATABASE_URL and 'id' in linha_atual:
+                tabela.rows = [d for d in dados if filtrar_linha(d)]
+
+            search_input.on('update:model-value', aplicar_filtros)
+            select_ano.on('update:model-value', aplicar_filtros)
+
+        # MODAL / DIÁLOGO DE CADASTRO DE DECRETO
+        with ui.dialog() as modal_cadastro, ui.card().classes('w-full max-w-lg p-6'):
+            ui.label('Cadastrar Novo Decreto').classes('text-xl font-bold mb-4 text-blue-900')
+            
+            in_exercicio = ui.input('Ano (Exercicio)', placeholder='Ex: 2026').classes('w-full')
+            in_numero = ui.input('Número do Decreto "G"', placeholder='Ex: 105').classes('w-full')
+            in_data = ui.input('Data (DD/MM/AAAA)', placeholder='Ex: 14/10/2026').classes('w-full')
+            in_orgao = ui.input('Órgão de Elaboração', placeholder='Ex: Coordenadoria de Assuntos de Secretaria').classes('w-full')
+            in_sei = ui.input('Processo SEI', placeholder='Ex: 3516309.433.00006204/2026-15').classes('w-full')
+            in_complemento = ui.textarea('Complemento / Informações (Ruas, Lotes, Nomes)', placeholder='Digite o resumo ou detalhes').classes('w-full')
+            in_link = ui.input('Link ou Nome do Arquivo do Decreto', placeholder='Ex: Decreto 105 G - ...pdf ou URL do Drive').classes('w-full')
+
+            def salvar_decreto():
+                novo_registro = {
+                    'exercicio_decreto': in_exercicio.value,
+                    'decreto_numero': in_numero.value,
+                    'data_elaboracao': in_data.value,
+                    'orgao_elaboracao': in_orgao.value,
+                    'processo_sei': in_sei.value,
+                    'complemento_informacoes': in_complemento.value,
+                    'link_decreto': in_link.value
+                }
+
+                # Salva no banco PostgreSQL Neon
+                if DATABASE_URL:
                     try:
                         engine = create_engine(DATABASE_URL)
-                        with engine.connect() as conn:
-                            query = text("""
-                                UPDATE decretos 
-                                SET exercicio_decreto = :exercicio_decreto,
-                                    decreto_numero = :decreto_numero,
-                                    data_elaboracao = :data_elaboracao,
-                                    orgao_elaboracao = :orgao_elaboracao,
-                                    processo_sei = :processo_sei,
-                                    link_decreto = :link_decreto
-                                WHERE id = :id
-                            """)
-                            conn.execute(query, linha_atual)
-                            conn.commit()
-                        ui.notify('Atualizado no banco Neon!', type='positive')
+                        df_novo = pd.DataFrame([novo_registro])
+                        df_novo.to_sql('decretos', engine, if_exists='append', index=False)
+                        ui.notify('Decreto cadastrado com sucesso no banco Neon!', type='positive')
                     except Exception as err:
-                        ui.notify(f'Erro ao atualizar: {err}', type='negative')
+                        ui.notify(f'Erro ao salvar no banco: {err}', type='negative')
 
-                tabela.update()
-                modal_edicao.close()
+                # Adiciona localmente na tabela NiceGUI na hora
+                dados.insert(0, novo_registro)
+                tabela.rows = dados
+                modal_cadastro.close()
 
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
-                ui.button('Cancelar', on_click=modal_edicao.close).classes('bg-gray-400 text-white')
-                ui.button('Salvar Alterações', on_click=salvar_edicao).classes('bg-blue-900 text-white font-bold')
-
-        def on_row_dblclick(e):
-            nonlocal linha_atual
-            linha_atual = e.args[1]
-            edit_ano.value = str(linha_atual.get('exercicio_decreto', ''))
-            edit_num.value = str(linha_atual.get('decreto_numero', ''))
-            edit_data.value = str(linha_atual.get('data_elaboracao', ''))
-            edit_orgao.value = str(linha_atual.get('orgao_elaboracao', ''))
-            edit_sei.value = str(linha_atual.get('processo_sei', ''))
-            edit_link.value = str(linha_atual.get('link_decreto', ''))
-            modal_edicao.open()
-
-        tabela.on('row-dblclick', on_row_dblclick)
-
-        def aplicar_filtros():
-            texto_busca = search_input.value.lower() if search_input.value else ''
-            ano_sel = select_ano.value
-
-            def filtrar_linha(row):
-                if ano_sel != 'Todos os Anos' and str(row.get('exercicio_decreto', '')).strip() != ano_sel:
-                    return False
-                if texto_busca:
-                    valores = ' '.join(str(v) for v in row.values()).lower()
-                    return texto_busca in valores
-                return True
-
-            tabela.rows = [d for d in dados if filtrar_linha(d)]
-
-        search_input.on('update:model-value', aplicar_filtros)
-        select_ano.on('update:model-value', aplicar_filtros)
+                ui.button('Cancelar', on_click=modal_cadastro.close).classes('bg-gray-400 text-white')
+                ui.button('Salvar Decreto', on_click=salvar_decreto).classes('bg-blue-900 text-white font-bold')
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(host='0.0.0.0', port=PORT, reload=False)
