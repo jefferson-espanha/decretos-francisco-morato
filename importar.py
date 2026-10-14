@@ -15,53 +15,47 @@ if RAW_DATABASE_URL.startswith("postgresql://"):
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
-def processar_linha(row):
-    # Trata Ano e Número do Decreto
-    val_exercicio = str(row.get('col0', '')).replace('.0', '').strip()
-    val_decreto = str(row.get('col1', '')).replace('.0', '').strip()
-    
-    ano = ''
-    num = val_decreto
+def extrair_numero_decreto(row):
+    # Se já existir número na coluna 1
+    val1 = str(row.get('col1', '')).replace('.0', '').strip()
+    if val1 and val1 != 'nan':
+        return val1
 
-    if len(val_exercicio) >= 4:
-        ano = val_exercicio[:4]
-        # Se a segunda coluna veio em branco, extrai o número do restante da primeira coluna
-        if not num and len(val_exercicio) > 4:
-            num = val_exercicio[4:]
-    else:
-        ano = val_exercicio
+    # Tenta extrair do início do texto/link (ex: "32Altera...", "1 Nomeação...")
+    link = str(row.get('col5', '')).strip()
+    match = re.match(r'^(\d+)', link)
+    if match:
+        return match.group(1)
 
-    # Se ainda não encontrou o número, tenta pegar do início do nome do arquivo
-    if not num:
-        link_str = str(row.get('col5', '')).strip()
-        match = re.search(r'Decreto\s+(\d+)', link_str, re.IGNORECASE)
-        if match:
-            num = match.group(1)
-        else:
-            match_num = re.match(r'^(\d+)', link_str)
-            if match_num:
-                num = match_num.group(1)
+    # Tenta extrair do final da coluna 0 (ex: 19841 -> 1)
+    col0 = str(row.get('col0', '')).replace('.0', '').strip()
+    if len(col0) > 4:
+        return col0[4:]
 
-    return pd.Series([ano, num])
+    return ''
+
+def extrair_ano(row):
+    col0 = str(row.get('col0', '')).replace('.0', '').strip()
+    if len(col0) >= 4:
+        return col0[:4]
+    return col0
 
 def importar_sheets():
     print("Baixando planilha do Google Drive...")
     df = pd.read_csv(SHEETS_URL)
 
-    # Pega as primeiras 6 colunas reais
+    # Seleciona as 6 primeiras colunas físicas
     df = df.iloc[:, :6]
     df.columns = ['col0', 'col1', 'col2', 'col3', 'col4', 'col5']
 
-    # Extrai Ano e Número do Decreto
-    df[['exercicio_decreto', 'decreto_numero']] = df.apply(processar_linha, axis=1)
-
-    # Mapeia as colunas finais
+    # Processa colunas
+    df['exercicio_decreto'] = df.apply(extrair_ano, axis=1)
+    df['decreto_numero'] = df.apply(extrair_numero_decreto, axis=1)
     df['data_elaboracao'] = pd.to_datetime(df['col2'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
-    df['orgao_elaboracao'] = df['col3'].astype(str).str.strip()
-    df['processo_sei'] = df['col4'].astype(str).str.strip()
-    df['link_decreto'] = df['col5'].astype(str).str.strip()
+    df['orgao_elaboracao'] = df['col3'].fillna('').astype(str).str.strip()
+    df['processo_sei'] = df['col4'].fillna('').astype(str).str.strip()
+    df['link_decreto'] = df['col5'].fillna('').astype(str).str.strip()
 
-    # Seleciona apenas as colunas formatadas
     df_final = df[[
         'exercicio_decreto',
         'decreto_numero',
@@ -73,18 +67,18 @@ def importar_sheets():
 
     df_final = df_final.fillna('')
 
-    # Adiciona chave ID para persistência no banco
+    # Cria ID para a chave primária do banco
     df_final.reset_index(inplace=True)
     df_final.rename(columns={'index': 'id'}, inplace=True)
     df_final['id'] = df_final['id'] + 1
 
-    print(f"Total de {len(df_final)} decretos processados com sucesso.")
+    print(f"Total de {len(df_final)} registros processados.")
     print("Conectando ao Neon PostgreSQL...")
     engine = create_engine(DATABASE_URL)
 
-    print("Substituindo dados na tabela 'decretos'...")
+    print("Recriando a tabela 'decretos' no Neon com o novo esquema...")
     df_final.to_sql('decretos', engine, if_exists='replace', index=False)
-    print("Sincronização concluída com sucesso!")
+    print("Tabela recriada e populada com sucesso!")
 
 if __name__ == "__main__":
     importar_sheets()
