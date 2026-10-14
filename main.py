@@ -2444,6 +2444,16 @@ COLUNAS_DADOS = [
     'processo_sei',
 ]
 
+CAMPOS_BUSCA = (
+    'exercicio_decreto',
+    'decreto_numero',
+    'data_elaboracao',
+    'assunto_decreto',
+    'orgao_elaboracao',
+    'processo_sei',
+    'link_decreto',
+)
+
 
 def texto_limpo(valor):
     """Converte valores vazios/nulos em texto e remove espaços externos."""
@@ -2540,6 +2550,9 @@ def normalizar_registros(registros):
             if campo not in ('exercicio_decreto', 'decreto_numero', 'data_elaboracao'):
                 linha[campo] = texto_limpo(linha.get(campo, ''))
 
+        linha['_search_text'] = ' '.join(
+            texto_limpo(linha.get(campo, '')) for campo in CAMPOS_BUSCA
+        ).casefold()
         # Chave única da interface, independente de ano/número repetidos.
         linha['_row_key'] = uuid.uuid4().hex
         normalizados.append(linha)
@@ -2711,6 +2724,10 @@ def aplicar_assuntos_e_links(registros):
             # Nome de arquivo não é URL: não transforma o texto em busca ampla do Drive.
             registro['link_decreto'] = ''
 
+    for registro in registros:
+        registro['_search_text'] = ' '.join(
+            texto_limpo(registro.get(campo, '')) for campo in CAMPOS_BUSCA
+        ).casefold()
     return registros
 
 
@@ -2833,7 +2850,7 @@ def main_page():
         with ui.row().classes('w-full gap-4 mb-4 items-center'):
             search_input = ui.input(
                 placeholder='🔍 Digite para pesquisar em toda a tabela...'
-            ).classes('flex-1 shadow-sm')
+            ).classes('flex-1 shadow-sm').props('debounce=250')
             select_ano = ui.select(
                 options=opcoes_ano,
                 value='Todos os Anos',
@@ -2904,11 +2921,11 @@ def main_page():
 
         tabela = ui.table(
             columns=colunas,
-            rows=dados,
+            rows=[],
             row_key='_row_key',
-            pagination=15,
+            pagination=50,
         ).classes('w-full shadow-lg rounded-lg border').props(
-            'table-style="width: 100%; table-layout: auto;"'
+            'table-style="width: 100%; table-layout: auto;" hide-bottom'
         )
 
         tabela.add_slot('body-cell-link_decreto', '''
@@ -2922,34 +2939,66 @@ def main_page():
             </q-td>
         ''')
 
-        campos_busca = (
-            'exercicio_decreto',
-            'decreto_numero',
-            'data_elaboracao',
-            'assunto_decreto',
-            'orgao_elaboracao',
-            'processo_sei',
-            'link_decreto',
-        )
+        tamanho_pagina = 50
+        estado_lista = {'pagina': 1, 'filtrados': []}
 
-        def aplicar_filtros():
-            texto_busca = (search_input.value or '').strip().lower()
-            ano_sel = select_ano.value
+        def aplicar_filtros(reset_pagina=True):
+            texto_busca = texto_limpo(search_input.value).casefold()
+            ano_sel = select_ano.value or 'Todos os Anos'
+            if reset_pagina:
+                estado_lista['pagina'] = 1
 
-            def filtrar_linha(row):
+            filtrados = []
+            for linha in dados:
                 if ano_sel != 'Todos os Anos' and normalizar_ano(
-                    row.get('exercicio_decreto', '')
+                    linha.get('exercicio_decreto', '')
                 ) != ano_sel:
-                    return False
-                if texto_busca:
-                    valores = ' '.join(texto_limpo(row.get(campo, '')) for campo in campos_busca)
-                    return texto_busca in valores.lower()
-                return True
+                    continue
+                texto_linha = linha.get('_search_text') or ''
+                if texto_busca and texto_busca not in texto_linha:
+                    continue
+                filtrados.append(linha)
 
-            tabela.rows = [linha for linha in dados if filtrar_linha(linha)]
+            estado_lista['filtrados'] = filtrados
+            total = len(filtrados)
+            total_paginas = max(1, (total + tamanho_pagina - 1) // tamanho_pagina)
+            estado_lista['pagina'] = min(estado_lista['pagina'], total_paginas)
+            inicio = (estado_lista['pagina'] - 1) * tamanho_pagina
+            fim = min(inicio + tamanho_pagina, total)
+            tabela.rows = filtrados[inicio:fim]
+            tabela.update()
+
+            if total:
+                texto_pagina = (
+                    f'Mostrando {inicio + 1}–{fim} de {total} decretos '
+                    f'(página {estado_lista["pagina"]} de {total_paginas})'
+                )
+            else:
+                texto_pagina = 'Nenhum decreto encontrado.'
+            informacao_pagina.set_text(texto_pagina)
+
+        def pagina_anterior():
+            if estado_lista['pagina'] > 1:
+                estado_lista['pagina'] -= 1
+                aplicar_filtros(reset_pagina=False)
+
+        def proxima_pagina():
+            total_paginas = max(
+                1,
+                (len(estado_lista['filtrados']) + tamanho_pagina - 1) // tamanho_pagina,
+            )
+            if estado_lista['pagina'] < total_paginas:
+                estado_lista['pagina'] += 1
+                aplicar_filtros(reset_pagina=False)
+
+        with ui.row().classes('w-full justify-between items-center mt-3'):
+            ui.button('← Anterior', on_click=pagina_anterior).props('outline')
+            informacao_pagina = ui.label('Carregando decretos...').classes('text-sm text-gray-600')
+            ui.button('Próxima →', on_click=proxima_pagina).props('outline')
 
         search_input.on('update:model-value', aplicar_filtros)
         select_ano.on('update:model-value', aplicar_filtros)
+        aplicar_filtros()
 
         estado_edicao = {'row_key': None, 'source_key': None}
 
@@ -3049,6 +3098,9 @@ def main_page():
                     'source_key': source_key,
                     '_row_key': chave_linha or uuid.uuid4().hex,
                 }
+                novo_registro['_search_text'] = ' '.join(
+                    texto_limpo(novo_registro.get(campo, '')) for campo in CAMPOS_BUSCA
+                ).casefold()
 
                 if DATABASE_URL:
                     try:
