@@ -17,6 +17,7 @@ else:
 PORT = int(os.environ.get('PORT', 8080))
 
 URL_PLANILHA = 'https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv'
+ARQUIVO_ASSUNTOS_LINKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'decreto_assuntos_links.csv')
 
 COLUNAS_DADOS = [
     'exercicio_decreto',
@@ -83,6 +84,11 @@ def normalizar_registros(registros):
         linha['exercicio_decreto'] = normalizar_ano(ano_original)
         linha['decreto_numero'] = normalizar_numero(numero_original)
         linha['data_elaboracao'] = formatar_data(linha.get('data_elaboracao', ''))
+        linha['assunto_decreto'] = texto_limpo(linha.get('assunto_decreto', ''))
+        if not linha['assunto_decreto']:
+            complemento = texto_limpo(linha.get('complemento_informacoes', ''))
+            if complemento.startswith('ASSUNTO: '):
+                linha['assunto_decreto'] = complemento.removeprefix('ASSUNTO: ').strip()
 
         for campo in COLUNAS_DADOS:
             linha.setdefault(campo, '')
@@ -150,6 +156,40 @@ def carregar_banco():
         return []
 
 
+def aplicar_assuntos_e_links(registros):
+    """Aplica assunto e link individual, usando ano+número como chave."""
+    try:
+        df = pd.read_csv(ARQUIVO_ASSUNTOS_LINKS, dtype=str).fillna('')
+        mapa = {
+            (normalizar_ano(linha['exercicio_decreto']), normalizar_numero(linha['decreto_numero'])):
+                (texto_limpo(linha['assunto_decreto']), texto_limpo(linha['link_decreto']))
+            for _, linha in df.iterrows()
+        }
+    except Exception as e:
+        print(f'Erro ao carregar assuntos/links individuais: {e}')
+        mapa = {}
+
+    for registro in registros:
+        chave = (
+            normalizar_ano(registro.get('exercicio_decreto', '')),
+            normalizar_numero(registro.get('decreto_numero', '')),
+        )
+        link_existente = texto_limpo(registro.get('link_decreto', ''))
+        if not registro.get('assunto_decreto') and link_existente and not link_existente.lower().startswith(('http://', 'https://')):
+            registro['assunto_decreto'] = link_existente
+
+        assunto_mapa, link_mapa = mapa.get(chave, ('', ''))
+        if assunto_mapa:
+            registro['assunto_decreto'] = assunto_mapa
+        if link_mapa.lower().startswith(('http://', 'https://')):
+            registro['link_decreto'] = link_mapa
+        elif not link_existente.lower().startswith(('http://', 'https://')):
+            # Nome de arquivo não é URL: não transforma o texto em busca ampla do Drive.
+            registro['link_decreto'] = ''
+
+    return registros
+
+
 def carregar_dados():
     # A planilha oficial contém Exercicio e Decreto “G” em colunas distintas.
     # Ela é usada como referência quando o banco tem números vazios.
@@ -161,9 +201,9 @@ def carregar_dados():
 
     dados_banco = carregar_banco()
     if not dados_planilha:
-        return dados_banco
+        return aplicar_assuntos_e_links(dados_banco)
     if not dados_banco:
-        return dados_planilha
+        return aplicar_assuntos_e_links(dados_planilha)
 
     por_ano_numero = {
         (linha['exercicio_decreto'], linha['decreto_numero']): i
@@ -206,7 +246,7 @@ def carregar_dados():
             dados_planilha.append(registro)
             por_ano_numero[(ano, numero)] = len(dados_planilha) - 1
 
-    return dados_planilha
+    return aplicar_assuntos_e_links(dados_planilha)
 
 
 @ui.page('/')
@@ -278,6 +318,14 @@ def main_page():
                 'headerStyle': 'min-width: 115px;',
             },
             {
+                'name': 'assunto_decreto',
+                'label': 'Assunto do Decreto',
+                'field': 'assunto_decreto',
+                'align': 'left',
+                'style': 'min-width: 320px; max-width: 520px; white-space: normal; overflow-wrap: anywhere;',
+                'headerStyle': 'min-width: 320px;',
+            },
+            {
                 'name': 'orgao_elaboracao',
                 'label': 'Elaboração',
                 'field': 'orgao_elaboracao',
@@ -295,11 +343,11 @@ def main_page():
             },
             {
                 'name': 'link_decreto',
-                'label': 'Link',
+                'label': 'Link do Decreto',
                 'field': 'link_decreto',
                 'align': 'center',
-                'style': 'min-width: 280px; width: 30%; white-space: normal;',
-                'headerStyle': 'min-width: 280px; width: 30%;',
+                'style': 'min-width: 115px; width: 120px;',
+                'headerStyle': 'min-width: 115px; width: 120px;',
             },
         ]
 
@@ -313,20 +361,12 @@ def main_page():
         )
 
         tabela.add_slot('body-cell-link_decreto', '''
-            <q-td :props="props" style="min-width: 280px; white-space: normal; overflow-wrap: anywhere;">
-                <template v-if="props.value">
-                    <a v-if="String(props.value).startsWith('http')"
-                       :href="props.value" target="_blank" rel="noopener noreferrer"
-                       class="text-blue-600 underline font-medium hover:text-blue-800">
-                        Abrir ↗
-                    </a>
-                    <a v-else
-                       :href="'https://drive.google.com/drive/search?q=' + encodeURIComponent(props.value)"
-                       target="_blank" rel="noopener noreferrer"
-                       class="text-blue-600 underline font-medium hover:text-blue-800">
-                        {{ props.value }} ↗
-                    </a>
-                </template>
+            <q-td :props="props" style="min-width: 115px; text-align: center;">
+                <a v-if="props.value && String(props.value).startsWith('http')"
+                   :href="props.value" target="_blank" rel="noopener noreferrer"
+                   class="inline-block rounded bg-blue-700 px-3 py-1 font-medium text-white hover:bg-blue-800">
+                    Abrir ↗
+                </a>
                 <span v-else class="text-gray-400">-</span>
             </q-td>
         ''')
@@ -335,6 +375,7 @@ def main_page():
             'exercicio_decreto',
             'decreto_numero',
             'data_elaboracao',
+            'assunto_decreto',
             'orgao_elaboracao',
             'processo_sei',
             'link_decreto',
@@ -373,21 +414,27 @@ def main_page():
                 'Processo SEI',
                 placeholder='Ex: 3516309.433.00006204/2026-15',
             ).classes('w-full')
+            in_assunto = ui.input(
+                'Assunto do Decreto',
+                placeholder='Digite o assunto; este campo será apenas texto',
+            ).classes('w-full')
             in_link = ui.input(
-                'Link ou Nome do Arquivo do Decreto',
-                placeholder='Ex: Decreto 105 G - ...pdf ou URL do Drive',
+                'Link direto do Decreto (Google Drive)',
+                placeholder='Cole o link compartilhável do PDF',
             ).classes('w-full')
 
             def salvar_decreto():
+                assunto = texto_limpo(in_assunto.value)
                 novo_registro = {
                     'exercicio_decreto': normalizar_ano(in_exercicio.value),
                     'decreto_numero': normalizar_numero(in_numero.value),
                     'data_elaboracao': formatar_data(in_data.value),
                     'orgao_elaboracao': texto_limpo(in_orgao.value),
                     'processo_sei': texto_limpo(in_sei.value),
+                    'assunto_decreto': assunto,
                     # Mantém compatibilidade com o esquema existente sem exibir
                     # nem solicitar este campo no formulário.
-                    'complemento_informacoes': '',
+                    'complemento_informacoes': f'ASSUNTO: {assunto}' if assunto else '',
                     'link_decreto': texto_limpo(in_link.value),
                     '_row_key': uuid.uuid4().hex,
                 }
@@ -398,7 +445,7 @@ def main_page():
                         registro_banco = {
                             chave: valor
                             for chave, valor in novo_registro.items()
-                            if chave != '_row_key'
+                            if chave not in ('_row_key', 'assunto_decreto')
                         }
                         pd.DataFrame([registro_banco]).to_sql(
                             'decretos', engine, if_exists='append', index=False
