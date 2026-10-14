@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 from sqlalchemy import create_engine, text
 from nicegui import ui
@@ -20,22 +21,24 @@ def carregar_dados():
             if not df.empty:
                 return df.fillna('').to_dict('records')
         except Exception as e:
-            print(f"Erro ao ler Neon: {e}")
+            print(f"Erro ao ler do banco Neon: {e}")
 
-    # Fallback leitura Google Drive
+    # Fallback caso o banco esteja indisponível
     url = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
     try:
         df = pd.read_csv(url).iloc[:, :6]
         df.columns = ['col0', 'col1', 'col2', 'col3', 'col4', 'col5']
         
-        # Tratamento de emergência caso o Neon esteja offline
         registros = []
         for idx, r in df.iterrows():
-            str_ex = str(r['col0']).replace('.0', '').strip()
-            ano = str_ex[:4] if len(str_ex) >= 4 else str_ex
+            col0 = str(r['col0']).replace('.0', '').strip()
+            ano = col0[:4] if len(col0) >= 4 else col0
+            
             num = str(r['col1']).replace('.0', '').strip()
-            if not num and len(str_ex) > 4:
-                num = str_ex[4:]
+            if not num or num == 'nan':
+                link_str = str(r['col5']).strip()
+                m = re.match(r'^(\d+)', link_str)
+                num = m.group(1) if m else (col0[4:] if len(col0) > 4 else '')
                 
             registros.append({
                 'id': idx + 1,
@@ -48,7 +51,7 @@ def carregar_dados():
             })
         return registros
     except Exception as e:
-        print(f"Erro Drive: {e}")
+        print(f"Erro ao carregar Google Drive: {e}")
         return []
 
 @ui.page('/')
@@ -63,15 +66,15 @@ def main_page():
         ui.label('Consulta Pública de Decretos Municipais').classes('text-2xl font-bold text-gray-800 mb-1')
         ui.label('Pesquise por ano, número do decreto, órgão ou processo SEI. Dê dois cliques em uma linha para editar.').classes('text-gray-600 mb-4')
 
-        # PAINEL FIXO PARA ADICIONAR NOVO DECRETO
+        # PAINEL FIXO DE CADASTRO
         with ui.expansion('➕ Cadastrar Novo Decreto', icon='add').classes('w-full bg-blue-50 border border-blue-200 rounded-lg mb-6 p-2'):
             with ui.grid(columns=3).classes('w-full gap-4 p-2'):
                 add_ano = ui.input('Ano', placeholder='Ex: 2026')
-                add_num = ui.input('Número Decreto "G"', placeholder='Ex: 105')
-                add_data = ui.input('Data (DD/MM/AAAA)', placeholder='Ex: 14/10/2026')
+                add_num = ui.input('Número Decreto "G"', placeholder='Ex: 32')
+                add_data = ui.input('Data (DD/MM/AAAA)', placeholder='Ex: 04/02/2026')
                 add_orgao = ui.input('Órgão de Elaboração', placeholder='Ex: Coordenadoria...')
-                add_sei = ui.input('Processo SEI', placeholder='Ex: 17129/2025')
-                add_link = ui.input('Link / Nome do Arquivo', placeholder='Ex: Decreto 105 G...pdf')
+                add_sei = ui.input('Processo SEI', placeholder='Ex: 1247/2026')
+                add_link = ui.input('Link / Nome do Arquivo', placeholder='Ex: Decreto...')
 
             def salvar_novo():
                 novo_id = (max([d.get('id', 0) for d in dados]) + 1) if dados else 1
@@ -85,7 +88,6 @@ def main_page():
                     'link_decreto': add_link.value
                 }
                 
-                # Inserção com SqlAlchemy no Neon
                 if DATABASE_URL:
                     try:
                         engine = create_engine(DATABASE_URL)
@@ -96,9 +98,9 @@ def main_page():
                             """)
                             conn.execute(query, novo)
                             conn.commit()
-                        ui.notify('Decreto gravado no Banco Neon!', type='positive')
+                        ui.notify('Decreto salvo no banco Neon!', type='positive')
                     except Exception as err:
-                        ui.notify(f'Erro ao salvar no banco: {err}', type='negative')
+                        ui.notify(f'Erro ao gravar: {err}', type='negative')
 
                 dados.insert(0, novo)
                 tabela.rows = dados
@@ -114,7 +116,6 @@ def main_page():
             search_input = ui.input(placeholder='🔍 Digite para pesquisar...').classes('flex-1 shadow-sm')
             select_ano = ui.select(options=opcoes_ano, value='Todos os Anos', label='Filtrar por Ano').classes('w-48 shadow-sm')
 
-        # ESTRUTURA DAS COLUNAS
         colunas = [
             {'name': 'exercicio_decreto', 'label': 'Ano', 'field': 'exercicio_decreto', 'sortable': True, 'align': 'center', 'classes': 'w-20'},
             {'name': 'decreto_numero', 'label': 'Decreto “G”', 'field': 'decreto_numero', 'sortable': True, 'align': 'center', 'classes': 'w-28 font-bold'},
@@ -131,7 +132,6 @@ def main_page():
             pagination=15
         ).classes('w-full shadow-lg rounded-lg border')
 
-        # LINK COM AUTO-AJUSTE DENTRO DO CONTAINER
         tabela.add_slot('body-cell-link_decreto', '''
             <q-td :props="props" class="whitespace-normal break-all">
                 <template v-if="props.value">
@@ -146,7 +146,7 @@ def main_page():
             </q-td>
         ''')
 
-        # MODAL DE EDIÇÃO PERSISTENTE (DUPLO CLIQUE)
+        # MODAL DE EDIÇÃO AO DAR DUPLO CLIQUE
         with ui.dialog() as modal_edicao, ui.card().classes('w-full max-w-lg p-6'):
             ui.label('Editar Decreto').classes('text-xl font-bold mb-4 text-blue-900')
             edit_ano = ui.input('Ano')
@@ -165,7 +165,6 @@ def main_page():
                 linha_atual['processo_sei'] = edit_sei.value
                 linha_atual['link_decreto'] = edit_link.value
 
-                # Atualiza diretamente no banco Neon usando o ID
                 if DATABASE_URL and 'id' in linha_atual:
                     try:
                         engine = create_engine(DATABASE_URL)
@@ -182,9 +181,9 @@ def main_page():
                             """)
                             conn.execute(query, linha_atual)
                             conn.commit()
-                        ui.notify('Alterações salvas permanentemente no Banco Neon!', type='positive')
+                        ui.notify('Atualizado no banco Neon!', type='positive')
                     except Exception as err:
-                        ui.notify(f'Erro ao atualizar no banco: {err}', type='negative')
+                        ui.notify(f'Erro ao atualizar: {err}', type='negative')
 
                 tabela.update()
                 modal_edicao.close()
@@ -206,7 +205,6 @@ def main_page():
 
         tabela.on('row-dblclick', on_row_dblclick)
 
-        # LÓGICA DE FILTRAGEM COMBINADA
         def aplicar_filtros():
             texto_busca = search_input.value.lower() if search_input.value else ''
             ano_sel = select_ano.value
