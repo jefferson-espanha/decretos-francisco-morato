@@ -2,6 +2,8 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine
 
+SHEETS_URL = "https://docs.google.com/spreadsheets/d/1ZfuaBX3ar5_oihkDfnJcaY6AUyJoWVY12Yzh4oiHIY0/export?format=csv"
+
 RAW_DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 if not RAW_DATABASE_URL:
@@ -12,17 +14,13 @@ if RAW_DATABASE_URL.startswith("postgresql://"):
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
-def subir_csv():
-    print("Lendo a planilha decretos.csv...")
-    try:
-        df = pd.read_csv("decretos.csv", encoding='utf-8')
-    except UnicodeDecodeError:
-        df = pd.read_csv("decretos.csv", encoding='latin1')
+def importar_sheets():
+    print("Baixando dados do Google Sheets...")
+    df = pd.read_csv(SHEETS_URL)
 
-    # Normaliza nomes removendo espaços extras
+    # Limpa espaços nos nomes das colunas
     df.columns = [str(col).strip() for col in df.columns]
 
-    # Mapeamento estrito para as colunas do Neon
     col_map = {
         'Exercicio': 'exercicio_decreto',
         'Data': 'data_elaboracao',
@@ -34,32 +32,17 @@ def subir_csv():
 
     df = df.rename(columns=col_map)
 
-    # FILTRO RIGOROSO: Mantém APENAS as colunas que existem no Neon
-    colunas_banco = [
-        'exercicio_decreto', 
-        'data_elaboracao', 
-        'link_decreto', 
-        'complemento_informacoes', 
-        'processo_sei'
-    ]
+    # Filtra apenas as colunas que pertencem ao banco
+    colunas_banco = ['exercicio_decreto', 'data_elaboracao', 'link_decreto', 'complemento_informacoes', 'processo_sei']
+    df = df[[c for c in colunas_banco if c in df.columns]]
 
-    colunas_finais = [c for c in colunas_banco if c in df.columns]
-    df = df[colunas_finais]
-
-    # Conversão de tipos de dados
-    if 'exercicio_decreto' in df.columns:
-        df['exercicio_decreto'] = pd.to_numeric(df['exercicio_decreto'], errors='coerce')
-
-    if 'data_elaboracao' in df.columns:
-        df['data_elaboracao'] = pd.to_datetime(df['data_elaboracao'], dayfirst=True, errors='coerce')
-
-    print(f"Colunas que serão enviadas: {list(df.columns)}")
     print("Conectando ao Neon PostgreSQL...")
     engine = create_engine(DATABASE_URL)
-    
-    print(f"Enviando {len(df)} registros para o Neon...")
-    df.to_sql('decretos', engine, if_exists='append', index=False)
-    print("Importação concluída com sucesso!")
+
+    print(f"Enviando {len(df)} registros do Google Sheets para o Neon...")
+    # if_exists='replace' recria a tabela limpa sem duplicar nem dar erro de coluna
+    df.to_sql('decretos', engine, if_exists='replace', index=False)
+    print("Sincronização com o Google Sheets concluída com sucesso!")
 
 if __name__ == "__main__":
-    subir_csv()
+    importar_sheets()
