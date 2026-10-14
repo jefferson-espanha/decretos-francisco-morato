@@ -7,7 +7,7 @@ import unicodedata
 import uuid
 
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, MetaData, Table, text
 from nicegui import ui
 
 RAW_DATABASE_URL = os.environ.get('DATABASE_URL', '')
@@ -2477,7 +2477,10 @@ def formatar_data(valor):
     data = texto_limpo(valor)
     if not data:
         return ''
-    convertida = pd.to_datetime(data, dayfirst=True, errors='coerce')
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', data):
+        convertida = pd.to_datetime(data, format='%Y-%m-%d', errors='coerce')
+    else:
+        convertida = pd.to_datetime(data, dayfirst=True, errors='coerce')
     if pd.isna(convertida):
         return data
     return convertida.strftime('%d/%m/%Y')
@@ -2488,6 +2491,32 @@ def normalizar_registros(registros):
     normalizados = []
     for registro in registros:
         linha = dict(registro)
+        nomes_colunas = {normalizar_cabecalho(chave): chave for chave in linha}
+        sinonimos = {
+            'exercicio_decreto': ('exercicio decreto', 'exercicio', 'ano'),
+            'decreto_numero': ('decreto numero', 'decreto g', 'decreto', 'numero do decreto'),
+            'data_elaboracao': ('data elaboracao', 'data'),
+            'orgao_elaboracao': ('orgao elaboracao', 'elaboracao', 'orgao'),
+            'processo_sei': ('processo sei', 'sei'),
+            'link_decreto': ('link do decreto', 'link decreto', 'link'),
+            'complemento_informacoes': ('complemento informacoes', 'complemento'),
+            'assunto_decreto': ('assunto decreto', 'assunto'),
+            'source_key': ('source key', 'chave origem', 'chave original'),
+        }
+        for campo, alternativas in sinonimos.items():
+            if texto_limpo(linha.get(campo, '')):
+                continue
+            for alternativa in alternativas:
+                chave = nomes_colunas.get(alternativa)
+                if chave is not None and texto_limpo(linha.get(chave, '')):
+                    linha[campo] = linha[chave]
+                    break
+            if not texto_limpo(linha.get(campo, '')) and campo == 'complemento_informacoes':
+                for nome_normalizado, chave in nomes_colunas.items():
+                    if nome_normalizado.startswith('complemento ') and texto_limpo(linha.get(chave, '')):
+                        linha[campo] = linha[chave]
+                        break
+
         ano_original = texto_limpo(linha.get('exercicio_decreto', ''))
         numero_original = texto_limpo(linha.get('decreto_numero', ''))
 
@@ -2500,6 +2529,7 @@ def normalizar_registros(registros):
         linha['decreto_numero'] = normalizar_numero(numero_original)
         linha['data_elaboracao'] = formatar_data(linha.get('data_elaboracao', ''))
         linha['assunto_decreto'] = texto_limpo(linha.get('assunto_decreto', ''))
+        linha['source_key'] = texto_limpo(linha.get('source_key', ''))
         if not linha['assunto_decreto']:
             complemento = texto_limpo(linha.get('complemento_informacoes', ''))
             if complemento.startswith('ASSUNTO: '):
@@ -2571,6 +2601,80 @@ def carregar_banco():
         return []
 
 
+def salvar_no_banco(registro, source_key):
+    """Cria as colunas canônicas que faltam e insere/atualiza por chave estável."""
+    engine = create_engine(DATABASE_URL)
+    campos = [
+        'exercicio_decreto',
+        'decreto_numero',
+        'data_elaboracao',
+        'orgao_elaboracao',
+        'processo_sei',
+        'complemento_informacoes',
+        'link_decreto',
+        'source_key',
+    ]
+    valores = {
+        campo: texto_limpo(registro.get(campo, '')) or None
+        for campo in campos
+    }
+    data_sql = pd.to_datetime(registro.get('data_elaboracao', ''), dayfirst=True, errors='coerce')
+    valores['data_elaboracao'] = None if pd.isna(data_sql) else data_sql.strftime('%Y-%m-%d')
+    valores['source_key'] = source_key
+
+    with engine.begin() as conexao:
+        conexao.execute(text('''
+            CREATE TABLE IF NOT EXISTS decretos (
+                exercicio_decreto TEXT,
+                decreto_numero TEXT,
+                data_elaboracao TEXT,
+                orgao_elaboracao TEXT,
+                processo_sei TEXT,
+                complemento_informacoes TEXT,
+                link_decreto TEXT,
+                source_key TEXT
+            )
+        '''))
+        nomes_existentes = {coluna['name'] for coluna in inspect(conexao).get_columns('decretos')}
+        for campo in campos:
+            if campo not in nomes_existentes:
+                conexao.execute(text(f'ALTER TABLE decretos ADD COLUMN {campo} TEXT'))
+
+    tabela_db = Table('decretos', MetaData(), autoload_with=engine)
+    sinonimos_db = {
+        'exercicio_decreto': {'exercicio decreto', 'exercicio', 'ano'},
+        'decreto_numero': {'decreto numero', 'decreto g', 'decreto', 'numero do decreto'},
+        'data_elaboracao': {'data elaboracao', 'data'},
+        'orgao_elaboracao': {'orgao elaboracao', 'elaboracao', 'orgao'},
+        'processo_sei': {'processo sei', 'sei'},
+        'complemento_informacoes': {'complemento informacoes', 'complemento'},
+        'link_decreto': {'link do decreto', 'link decreto', 'link'},
+        'source_key': {'source key', 'chave origem', 'chave original'},
+    }
+    valores_coluna = {}
+    for coluna in tabela_db.columns:
+        nome = normalizar_cabecalho(coluna.name)
+        for campo, sinonimos in sinonimos_db.items():
+            if nome in sinonimos or (campo == 'complemento_informacoes' and nome.startswith('complemento')):
+                valor = valores[campo]
+                if campo == 'data_elaboracao' and valor:
+                    try:
+                        valor = pd.to_datetime(valor, errors='coerce').date()
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                valores_coluna[coluna.name] = valor
+                break
+
+    with engine.begin() as conexao:
+        atualizacao = conexao.execute(
+            tabela_db.update()
+            .where(tabela_db.c.source_key == source_key)
+            .values(**valores_coluna)
+        )
+        if atualizacao.rowcount == 0:
+            conexao.execute(tabela_db.insert().values(**valores_coluna))
+
+
 def aplicar_assuntos_e_links(registros):
     """Aplica assunto e link individual, usando ano+número como chave."""
     try:
@@ -2586,6 +2690,10 @@ def aplicar_assuntos_e_links(registros):
         mapa = {}
 
     for registro in registros:
+        if registro.get('source_key'):
+            # Um registro editado/cadastrado no Neon tem precedência sobre o mapa
+            # incorporado, inclusive quando o usuário esvazia um campo.
+            continue
         chave = (
             normalizar_ano(registro.get('exercicio_decreto', '')),
             normalizar_numero(registro.get('decreto_numero', '')),
@@ -2632,12 +2740,29 @@ def carregar_dados():
         if all(chave):
             por_ano_data.setdefault(chave, []).append(i)
 
+    chaves_removidas = set()
     for registro in dados_banco:
         ano = registro['exercicio_decreto']
         numero = registro['decreto_numero']
-        indice = por_ano_numero.get((ano, numero)) if numero else None
+        chave_atual = (ano, numero)
+        source_key = texto_limpo(registro.get('source_key', ''))
+        chave_original = None
+        if '|' in source_key:
+            ano_original, numero_original = source_key.rsplit('|', 1)
+            chave_original = (
+                normalizar_ano(ano_original),
+                normalizar_numero(numero_original),
+            )
 
-        if indice is None and ano and registro['data_elaboracao']:
+        indice = por_ano_numero.get(chave_atual) if ano and numero else None
+        if chave_original and chave_original != chave_atual:
+            indice_antigo = por_ano_numero.get(chave_original)
+            if indice_antigo is not None:
+                chaves_removidas.add(dados_planilha[indice_antigo]['_row_key'])
+        elif chave_original and chave_original == chave_atual:
+            indice = por_ano_numero.get(chave_original, indice)
+
+        if indice is None and not source_key and ano and registro['data_elaboracao']:
             candidatos = por_ano_data.get((ano, registro['data_elaboracao']), [])
             for campo in ('orgao_elaboracao', 'link_decreto', 'processo_sei'):
                 valor = registro.get(campo, '')
@@ -2650,18 +2775,27 @@ def carregar_dados():
 
         if indice is not None:
             destino = dados_planilha[indice]
-            for campo in COLUNAS_DADOS:
-                # O ano e o número da planilha são a referência canônica.
-                if campo in ('exercicio_decreto', 'decreto_numero'):
-                    continue
-                if registro.get(campo):
-                    destino[campo] = registro[campo]
-        elif numero:
+            if source_key:
+                for campo in (*COLUNAS_DADOS, 'assunto_decreto'):
+                    destino[campo] = registro.get(campo, '')
+                destino['exercicio_decreto'] = ano
+                destino['decreto_numero'] = numero
+                destino['source_key'] = source_key
+            else:
+                for campo in COLUNAS_DADOS:
+                    # O ano e o número da planilha são a referência canônica.
+                    if campo in ('exercicio_decreto', 'decreto_numero'):
+                        continue
+                    if registro.get(campo):
+                        destino[campo] = registro[campo]
+        elif ano and numero:
             # Mantém decretos cadastrados no banco que ainda não estão na planilha.
             registro['_row_key'] = uuid.uuid4().hex
             dados_planilha.append(registro)
-            por_ano_numero[(ano, numero)] = len(dados_planilha) - 1
+            por_ano_numero[chave_atual] = len(dados_planilha) - 1
 
+    if chaves_removidas:
+        dados_planilha = [linha for linha in dados_planilha if linha['_row_key'] not in chaves_removidas]
     return aplicar_assuntos_e_links(dados_planilha)
 
 
@@ -2674,7 +2808,7 @@ def main_page():
         ui.label('Prefeitura de Francisco Morato — Decretos').classes('text-xl font-bold')
         ui.button(
             '➕ Adicionar Decreto',
-            on_click=lambda: modal_cadastro.open(),
+            on_click=lambda: abrir_novo_decreto(),
         ).classes('bg-green-600 hover:bg-green-700 text-white font-bold')
 
     with ui.column().classes('w-full p-6 max-w-7xl mx-auto'):
@@ -2684,6 +2818,7 @@ def main_page():
         ui.label(
             'Pesquise por nome, rua, lote, número do decreto, órgão ou processo SEI.'
         ).classes('text-gray-600 mb-6')
+        ui.label('Dê dois cliques em um decreto para abrir a edição.').classes('text-sm text-gray-500 mb-3')
 
         anos_disponiveis = sorted(
             {
@@ -2816,8 +2951,10 @@ def main_page():
         search_input.on('update:model-value', aplicar_filtros)
         select_ano.on('update:model-value', aplicar_filtros)
 
+        estado_edicao = {'row_key': None, 'source_key': None}
+
         with ui.dialog() as modal_cadastro, ui.card().classes('w-full max-w-lg p-6'):
-            ui.label('Cadastrar Novo Decreto').classes('text-xl font-bold mb-4 text-blue-900')
+            ui.label('Cadastrar ou editar decreto').classes('text-xl font-bold mb-4 text-blue-900')
 
             in_exercicio = ui.input('Ano (Exercício)', placeholder='Ex: 2026').classes('w-full')
             in_numero = ui.input('Número do Decreto "G"', placeholder='Ex: 105').classes('w-full')
@@ -2839,52 +2976,114 @@ def main_page():
                 placeholder='Cole o link compartilhável do PDF',
             ).classes('w-full')
 
+            def definir_valor(campo, valor):
+                campo.value = texto_limpo(valor)
+                campo.update()
+
+            def abrir_novo_decreto():
+                estado_edicao['row_key'] = None
+                estado_edicao['source_key'] = None
+                for campo in (in_exercicio, in_numero, in_data, in_orgao, in_sei, in_assunto, in_link):
+                    definir_valor(campo, '')
+                modal_cadastro.open()
+
+            def extrair_linha(objeto):
+                if isinstance(objeto, dict):
+                    if objeto.get('_row_key'):
+                        return objeto
+                    for valor in objeto.values():
+                        linha = extrair_linha(valor)
+                        if linha is not None:
+                            return linha
+                elif isinstance(objeto, (list, tuple)):
+                    for valor in objeto:
+                        linha = extrair_linha(valor)
+                        if linha is not None:
+                            return linha
+                return None
+
+            def abrir_edicao(evento):
+                linha = extrair_linha(getattr(evento, 'args', evento))
+                if linha is None:
+                    ui.notify('Não consegui identificar a linha. Tente dar duplo clique novamente.', type='warning')
+                    return
+                estado_edicao['row_key'] = linha.get('_row_key')
+                estado_edicao['source_key'] = linha.get('source_key') or (
+                    f"{linha.get('exercicio_decreto', '')}|{linha.get('decreto_numero', '')}"
+                )
+                definir_valor(in_exercicio, linha.get('exercicio_decreto', ''))
+                definir_valor(in_numero, linha.get('decreto_numero', ''))
+                definir_valor(in_data, linha.get('data_elaboracao', ''))
+                definir_valor(in_orgao, linha.get('orgao_elaboracao', ''))
+                definir_valor(in_sei, linha.get('processo_sei', ''))
+                definir_valor(in_assunto, linha.get('assunto_decreto', ''))
+                definir_valor(in_link, linha.get('link_decreto', ''))
+                modal_cadastro.open()
+
             def salvar_decreto():
+                ano = normalizar_ano(in_exercicio.value)
+                numero = normalizar_numero(in_numero.value)
+                if not ano or not numero:
+                    ui.notify('Preencha o ano e o número do decreto.', type='warning')
+                    return
+
+                chave_linha = estado_edicao['row_key']
+                for existente in dados:
+                    if existente.get('_row_key') == chave_linha:
+                        continue
+                    if (existente.get('exercicio_decreto'), existente.get('decreto_numero')) == (ano, numero):
+                        ui.notify('Já existe um decreto com esse ano e número.', type='warning')
+                        return
+
                 assunto = texto_limpo(in_assunto.value)
+                source_key = estado_edicao['source_key'] or f'{ano}|{numero}'
                 novo_registro = {
-                    'exercicio_decreto': normalizar_ano(in_exercicio.value),
-                    'decreto_numero': normalizar_numero(in_numero.value),
+                    'exercicio_decreto': ano,
+                    'decreto_numero': numero,
                     'data_elaboracao': formatar_data(in_data.value),
                     'orgao_elaboracao': texto_limpo(in_orgao.value),
                     'processo_sei': texto_limpo(in_sei.value),
                     'assunto_decreto': assunto,
-                    # Mantém compatibilidade com o esquema existente sem exibir
-                    # nem solicitar este campo no formulário.
                     'complemento_informacoes': f'ASSUNTO: {assunto}' if assunto else '',
                     'link_decreto': texto_limpo(in_link.value),
-                    '_row_key': uuid.uuid4().hex,
+                    'source_key': source_key,
+                    '_row_key': chave_linha or uuid.uuid4().hex,
                 }
 
                 if DATABASE_URL:
                     try:
-                        engine = create_engine(DATABASE_URL)
-                        registro_banco = {
-                            chave: valor
-                            for chave, valor in novo_registro.items()
-                            if chave not in ('_row_key', 'assunto_decreto')
-                        }
-                        pd.DataFrame([registro_banco]).to_sql(
-                            'decretos', engine, if_exists='append', index=False
-                        )
-                        ui.notify('Decreto cadastrado com sucesso no banco Neon!', type='positive')
+                        salvar_no_banco(novo_registro, source_key)
                     except Exception as err:
                         ui.notify(f'Erro ao salvar no banco: {err}', type='negative')
                         return
 
-                dados.insert(0, novo_registro)
-                if novo_registro['exercicio_decreto'] not in opcoes_ano:
-                    opcoes_ano.append(novo_registro['exercicio_decreto'])
+                indice_existente = next(
+                    (i for i, linha in enumerate(dados) if linha.get('_row_key') == chave_linha),
+                    None,
+                ) if chave_linha else None
+                if indice_existente is None:
+                    dados.insert(0, novo_registro)
+                else:
+                    dados[indice_existente] = novo_registro
+
+                if ano not in opcoes_ano:
+                    opcoes_ano.append(ano)
                     opcoes_ano[1:] = sorted(opcoes_ano[1:], reverse=True)
                     select_ano.options = opcoes_ano
                     select_ano.update()
                 aplicar_filtros()
                 modal_cadastro.close()
+                estado_edicao['row_key'] = None
+                estado_edicao['source_key'] = None
+                ui.notify('Decreto salvo/atualizado com sucesso.', type='positive')
 
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
                 ui.button('Cancelar', on_click=modal_cadastro.close).classes('bg-gray-400 text-white')
-                ui.button('Salvar Decreto', on_click=salvar_decreto).classes(
+                ui.button('Salvar / Atualizar Decreto', on_click=salvar_decreto).classes(
                     'bg-blue-900 text-white font-bold'
                 )
+
+        tabela.on('rowDblclick', abrir_edicao)
 
 
 if __name__ in {'__main__', '__mp_main__'}:
