@@ -2652,6 +2652,10 @@ def salvar_no_banco(registro, source_key):
         for campo in campos:
             if campo not in nomes_existentes:
                 conexao.execute(text(f'ALTER TABLE decretos ADD COLUMN {campo} TEXT'))
+            else:
+                # Bancos antigos podem ter sido criados com VARCHAR(100),
+                # causando erro ao salvar assuntos ou textos mais longos.
+                conexao.execute(text(f'ALTER TABLE decretos ALTER COLUMN {campo} TYPE TEXT'))
 
     tabela_db = Table('decretos', MetaData(), autoload_with=engine)
     sinonimos_db = {
